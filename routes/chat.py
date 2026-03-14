@@ -84,6 +84,25 @@ def _dbg(message: str) -> None:
         logger.info('[聊天补全调试] %s', message)
 
 
+def _extract_responses_usage(event_data: dict[str, Any]) -> dict[str, Any] | None:
+    """从原生 Responses 事件中提取 usage。
+
+    `/v1/chat/completions -> /v1/responses` 的桥接流式路径也需要读取 usage，
+    因此在本文件保留一个本地辅助函数，避免依赖其他路由模块的私有实现。
+    """
+    if not isinstance(event_data, dict):
+        return None
+    usage = event_data.get('usage')
+    if isinstance(usage, dict):
+        return usage
+    response_obj = event_data.get('response')
+    if isinstance(response_obj, dict):
+        nested_usage = response_obj.get('usage')
+        if isinstance(nested_usage, dict):
+            return nested_usage
+    return None
+
+
 @bp.route('/v1/chat/completions', methods=['POST'])
 def chat_completions():
     """处理聊天补全请求并按模型映射分发到不同后端。"""
