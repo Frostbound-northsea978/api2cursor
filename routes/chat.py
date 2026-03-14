@@ -354,8 +354,16 @@ def _handle_responses_stream(
 
         event_count = 0
         client_chunks: list[Any] = []
+        last_usage: dict[str, Any] | None = None
         for event_type, event_data in iter_responses_sse(resp):
             append_upstream_event(turn, {'type': event_type, 'data': event_data})
+            extracted_usage = _extract_responses_usage(event_data)
+            if extracted_usage:
+                last_usage = {
+                    'prompt_tokens': extracted_usage.get('input_tokens', 0),
+                    'completion_tokens': extracted_usage.get('output_tokens', 0),
+                    'total_tokens': extracted_usage.get('total_tokens', 0),
+                }
             if event_count < 10:
                 _dbg(
                     f'上游事件#{event_count} 类型={event_type} 数据='
@@ -365,6 +373,8 @@ def _handle_responses_stream(
             for chunk in converter.process_event(event_type, event_data):
                 client_chunks.append(chunk)
                 append_client_event(turn, {'type': 'chat_chunk', 'data': chunk})
+                if isinstance(chunk, dict) and isinstance(chunk.get('usage'), dict):
+                    last_usage = chunk['usage']
                 if event_count < 10:
                     _dbg(
                         f'返回片段#{event_count}='
@@ -377,17 +387,19 @@ def _handle_responses_stream(
         _dbg(f'流式响应结束，共 {event_count} 个事件')
         append_client_event(turn, {'type': 'done'})
         yield sse_data_message('[DONE]')
-        usage_tracker.record(ctx.client_model)
+        usage_tracker.record(ctx.client_model, last_usage)
         set_stream_summary(turn, {
             'event_count': event_count,
             'client_chunk_count': len(client_chunks),
+            'usage': last_usage,
         })
         attach_client_response(turn, {
             'type': 'chat.completion.stream.summary',
             'model': ctx.client_model,
             'chunk_count': len(client_chunks),
+            'usage': last_usage,
         })
-        finalize_turn(turn)
+        finalize_turn(turn, usage=last_usage)
 
     return sse_response(generate())
 
@@ -455,8 +467,16 @@ def _handle_gemini_stream(
 
         chunk_count = 0
         client_chunks: list[Any] = []
+        last_usage: dict[str, Any] | None = None
         for gemini_chunk in iter_gemini_sse(resp):
             append_upstream_event(turn, {'type': 'gemini_chunk', 'data': gemini_chunk})
+            usage_meta = gemini_chunk.get('usageMetadata') if isinstance(gemini_chunk, dict) else None
+            if isinstance(usage_meta, dict):
+                last_usage = {
+                    'prompt_tokens': usage_meta.get('promptTokenCount', 0),
+                    'completion_tokens': usage_meta.get('candidatesTokenCount', 0),
+                    'total_tokens': usage_meta.get('totalTokenCount', 0),
+                }
             if chunk_count < 10:
                 _dbg(
                     f'上游 Gemini 片段#{chunk_count}='
@@ -467,6 +487,8 @@ def _handle_gemini_stream(
                 cc_chunk['model'] = ctx.client_model
                 client_chunks.append(cc_chunk)
                 append_client_event(turn, {'type': 'chat_chunk', 'data': cc_chunk})
+                if isinstance(cc_chunk, dict) and isinstance(cc_chunk.get('usage'), dict):
+                    last_usage = cc_chunk['usage']
                 if chunk_count < 10:
                     _dbg(
                         f'返回片段#{chunk_count}='
@@ -479,17 +501,19 @@ def _handle_gemini_stream(
         _dbg(f'流式响应结束，共 {chunk_count} 个数据片段')
         append_client_event(turn, {'type': 'done'})
         yield sse_data_message('[DONE]')
-        usage_tracker.record(ctx.client_model)
+        usage_tracker.record(ctx.client_model, last_usage)
         set_stream_summary(turn, {
             'chunk_count': chunk_count,
             'client_chunk_count': len(client_chunks),
+            'usage': last_usage,
         })
         attach_client_response(turn, {
             'type': 'chat.completion.stream.summary',
             'model': ctx.client_model,
             'chunk_count': len(client_chunks),
+            'usage': last_usage,
         })
-        finalize_turn(turn)
+        finalize_turn(turn, usage=last_usage)
 
     return sse_response(generate())
 
@@ -565,8 +589,29 @@ def _handle_anthropic_stream(
 
         event_count = 0
         client_chunks: list[Any] = []
+        last_usage: dict[str, Any] | None = None
         for event_type, event_data in iter_anthropic_sse(resp):
             append_upstream_event(turn, {'type': event_type, 'data': event_data})
+            if event_type == 'message_start':
+                message_usage = event_data.get('message', {}).get('usage', {})
+                if isinstance(message_usage, dict):
+                    last_usage = {
+                        'prompt_tokens': message_usage.get('input_tokens', 0),
+                        'completion_tokens': 0,
+                        'total_tokens': message_usage.get('input_tokens', 0),
+                    }
+            elif event_type == 'message_delta':
+                delta_usage = event_data.get('usage', {})
+                if isinstance(delta_usage, dict):
+                    prompt_tokens = 0
+                    if isinstance(last_usage, dict):
+                        prompt_tokens = last_usage.get('prompt_tokens', 0)
+                    completion_tokens = delta_usage.get('output_tokens', 0)
+                    last_usage = {
+                        'prompt_tokens': prompt_tokens,
+                        'completion_tokens': completion_tokens,
+                        'total_tokens': prompt_tokens + completion_tokens,
+                    }
             if event_count < 10:
                 _dbg(
                     f'上游事件#{event_count} 类型={event_type} 数据='
@@ -577,6 +622,8 @@ def _handle_anthropic_stream(
                 try:
                     chunk_obj = json.loads(chunk_str)
                     chunk_obj['model'] = ctx.client_model
+                    if isinstance(chunk_obj.get('usage'), dict):
+                        last_usage = chunk_obj['usage']
                     chunk_str = json.dumps(chunk_obj, ensure_ascii=False)
                 except (json.JSONDecodeError, TypeError):
                     pass
@@ -592,17 +639,19 @@ def _handle_anthropic_stream(
         _dbg(f'流式响应结束，共 {event_count} 个事件')
         append_client_event(turn, {'type': 'done'})
         yield sse_data_message('[DONE]')
-        usage_tracker.record(ctx.client_model)
+        usage_tracker.record(ctx.client_model, last_usage)
         set_stream_summary(turn, {
             'event_count': event_count,
             'client_chunk_count': len(client_chunks),
+            'usage': last_usage,
         })
         attach_client_response(turn, {
             'type': 'chat.completion.stream.summary',
             'model': ctx.client_model,
             'chunk_count': len(client_chunks),
+            'usage': last_usage,
         })
-        finalize_turn(turn)
+        finalize_turn(turn, usage=last_usage)
 
     return sse_response(generate())
 
