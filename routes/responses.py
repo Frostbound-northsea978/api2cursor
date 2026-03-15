@@ -28,6 +28,8 @@ from routes.common import (
     build_responses_target,
     build_route_context,
     ensure_responses_cache_control,
+    attach_previous_response_id,
+    remember_response_id,
     inject_instructions_anthropic,
     inject_instructions_cc,
     inject_instructions_responses,
@@ -249,6 +251,7 @@ def _handle_responses_backend(ctx: RouteContext, payload: dict[str, Any], turn: 
     payload['model'] = ctx.upstream_model
     payload = inject_instructions_responses(payload, ctx.custom_instructions, ctx.instructions_position)
     payload = ensure_responses_cache_control(payload)
+    payload = attach_previous_response_id(payload)
     url, headers = build_responses_target(ctx)
     payload = apply_body_modifications(payload, ctx.body_modifications)
     headers = apply_header_modifications(headers, ctx.header_modifications)
@@ -276,6 +279,7 @@ def _handle_responses_non_stream(
 
     response_data = resp.json()
     attach_upstream_response(turn, response_data)
+    remember_response_id(payload, response_data)
     response_data['model'] = ctx.client_model
     return _finalize_responses_response(
         response_data,
@@ -315,6 +319,10 @@ def _handle_responses_stream(
             extracted_usage = _extract_responses_usage(event_data)
             if extracted_usage:
                 last_usage = extracted_usage
+            if event_type == 'response.completed':
+                response_obj = event_data.get('response') if isinstance(event_data, dict) else None
+                if isinstance(response_obj, dict):
+                    remember_response_id(payload, response_obj)
             if event_count < 10:
                 _dbg(
                     f'上游事件#{event_count} 类型={event_type} 数据='

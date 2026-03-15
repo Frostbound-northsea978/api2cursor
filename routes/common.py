@@ -7,14 +7,21 @@ SSE 消息拼装逻辑，避免 `chat.py` 和 `responses.py` 各自维护重复�
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 import json
 import logging
+import threading
+import time
 from typing import Any
 
 import settings
 from utils.http import build_anthropic_headers, build_gemini_headers, build_openai_headers
 
 logger = logging.getLogger(__name__)
+
+_RESPONSES_PREV_ID_LOCK = threading.Lock()
+_RESPONSES_PREV_ID_TTL = 86400
+_RESPONSES_PREV_IDS: dict[str, tuple[str, float]] = {}
 
 
 @dataclass(frozen=True)
@@ -210,6 +217,161 @@ def ensure_responses_cache_control(payload: dict[str, Any]) -> dict[str, Any]:
     payload['cache_control'] = {'type': 'ephemeral'}
     logger.info('已为 Responses 请求自动启用 cache_control=ephemeral')
     return payload
+
+
+def attach_previous_response_id(payload: dict[str, Any]) -> dict[str, Any]:
+    """为多轮 Responses 请求补齐上一轮 response_id。
+
+    某些上游在 `/v1/responses` 多轮场景下，只有沿用 `previous_response_id` 才能稳定复用
+    上一轮的服务端响应链与缓存。Cursor 通常会回传完整历史，但不会主动带这个字段，
+    因此代理需要基于稳定对话键做一次轻量补齐。
+    """
+    if not isinstance(payload, dict) or payload.get('previous_response_id'):
+        return payload
+    key = _responses_prev_id_key(payload)
+    if not key:
+        return payload
+    previous_response_id = _get_previous_response_id(key)
+    if not previous_response_id:
+        return payload
+    payload['previous_response_id'] = previous_response_id
+    logger.info('已为 Responses 请求补齐 previous_response_id')
+    return payload
+
+
+def remember_response_id(payload: dict[str, Any], response_data: dict[str, Any]) -> None:
+    """记住当前对话最近一次上游 Responses response_id。"""
+    if not isinstance(payload, dict) or not isinstance(response_data, dict):
+        return
+    response_id = response_data.get('id')
+    if not isinstance(response_id, str) or not response_id.strip():
+        return
+    key = _responses_prev_id_key(payload)
+    if not key:
+        return
+    with _RESPONSES_PREV_ID_LOCK:
+        _RESPONSES_PREV_IDS[key] = (response_id.strip(), time.time())
+        _cleanup_previous_response_ids_locked()
+
+
+def _responses_prev_id_key(payload: dict[str, Any]) -> str:
+    """基于 Responses 请求的“对话根信息”生成稳定键。
+
+    这里故意不直接使用完整 `input` 作为键，因为多轮对话每轮都会追加历史；
+    如果把整段历史都纳入哈希，键会在每一轮变化，导致无法稳定取回上一轮的
+    `previous_response_id`。当前策略只取 instructions 与首轮 user/assistant 根消息。
+    """
+    instructions = payload.get('instructions') or ''
+    input_data = payload.get('input', [])
+    if isinstance(input_data, str):
+        seed_input = input_data
+    elif isinstance(input_data, list):
+        seed_input = _responses_root_seed_from_items(input_data)
+    else:
+        seed_input = json.dumps(input_data, ensure_ascii=False, default=str)
+    raw = instructions + '|' + seed_input
+    if not raw.strip('|'):
+        return ''
+    return hashlib.sha256(raw.encode('utf-8')).hexdigest()[:24]
+
+
+def _responses_root_seed_from_items(items: list[Any]) -> str:
+    """从 Responses `input` 中提取足够稳定的对话根片段。
+
+    目标不是完整还原会话，而是构造一个在同一段对话内尽量恒定、跨轮次可复用的
+    seed。这里沿用项目里 conversation seed 的思路：优先取第一条 user 与第一条
+    assistant；如果 assistant 还不存在，则只用第一条 user。
+    """
+    first_user = None
+    first_assistant = None
+    for item in items:
+        if isinstance(item, str):
+            if first_user is None:
+                first_user = {'role': 'user', 'content': item}
+            continue
+        if not isinstance(item, dict):
+            continue
+        item_type = item.get('type', '')
+        role = item.get('role', '')
+        if item_type == 'message' and role in ('user', 'assistant'):
+            normalized = {
+                'role': role,
+                'content': _responses_normalize_content(item.get('content', [])),
+            }
+            if role == 'user' and first_user is None:
+                first_user = normalized
+            elif role == 'assistant' and first_assistant is None:
+                first_assistant = normalized
+        elif role in ('user', 'assistant') and not item_type:
+            normalized = {
+                'role': role,
+                'content': _responses_normalize_content(item.get('content', '')),
+            }
+            if role == 'user' and first_user is None:
+                first_user = normalized
+            elif role == 'assistant' and first_assistant is None:
+                first_assistant = normalized
+        if first_user is not None and first_assistant is not None:
+            break
+    parts = []
+    if first_user is not None:
+        parts.append(first_user)
+    if first_assistant is not None:
+        parts.append(first_assistant)
+    return json.dumps(parts, ensure_ascii=False, separators=(',', ':'))
+
+
+def _responses_normalize_content(content: Any) -> str:
+    """把 Responses 各种 content 形态折叠成稳定文本。
+
+    这里的目标不是保真展示，而是降低结构差异对 key 计算的影响；只抽取会影响
+    会话根语义的文本型内容，忽略无关字段，避免同一轮请求因格式细节不同而得到
+    不同的 previous_response_id 键。
+    """
+    if isinstance(content, str):
+        return content.strip()
+    if not isinstance(content, list):
+        return str(content).strip() if content is not None else ''
+    texts: list[str] = []
+    for part in content:
+        if isinstance(part, str):
+            texts.append(part)
+            continue
+        if not isinstance(part, dict):
+            continue
+        if part.get('type') in ('input_text', 'output_text', 'text'):
+            texts.append(part.get('text', ''))
+        elif part.get('type') == 'summary_text':
+            texts.append(part.get('text', ''))
+    return '\n'.join(texts).strip()
+
+
+def _get_previous_response_id(key: str) -> str:
+    """按稳定键读取上一轮 response_id，并在过期时顺手清理。"""
+    with _RESPONSES_PREV_ID_LOCK:
+        entry = _RESPONSES_PREV_IDS.get(key)
+        if not entry:
+            return ''
+        response_id, ts = entry
+        if (time.time() - ts) >= _RESPONSES_PREV_ID_TTL:
+            _RESPONSES_PREV_IDS.pop(key, None)
+            return ''
+        return response_id
+
+
+def _cleanup_previous_response_ids_locked() -> None:
+    """清理过期的 previous_response_id 缓存项。
+
+    这张表只用于短期多轮续接；一旦对话长时间不活跃，就不再需要继续保留，
+    以免常驻进程运行过久后累计过多失效状态。
+    """
+    now = time.time()
+    expired = [
+        key for key, (_, ts) in _RESPONSES_PREV_IDS.items()
+        if (now - ts) >= _RESPONSES_PREV_ID_TTL
+    ]
+    for key in expired:
+        _RESPONSES_PREV_IDS.pop(key, None)
 
 
 def inject_instructions_anthropic(payload: dict[str, Any], instructions: str, position: str = 'prepend') -> dict[str, Any]:

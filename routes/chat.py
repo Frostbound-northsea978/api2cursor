@@ -43,6 +43,8 @@ from routes.common import (
     build_route_context,
     chat_error_chunk,
     ensure_responses_cache_control,
+    attach_previous_response_id,
+    remember_response_id,
     inject_instructions_anthropic,
     inject_instructions_cc,
     inject_instructions_responses,
@@ -313,6 +315,7 @@ def _handle_responses_backend(ctx: RouteContext, payload: dict[str, Any], turn: 
     responses_payload['model'] = ctx.upstream_model
     responses_payload = inject_instructions_responses(responses_payload, ctx.custom_instructions, ctx.instructions_position)
     responses_payload = ensure_responses_cache_control(responses_payload)
+    responses_payload = attach_previous_response_id(responses_payload)
     _dbg(
         '已转换为 Responses 请求：字段=' + str(list(responses_payload.keys()))
         + f' 输入项数={len(responses_payload.get("input", []))}'
@@ -347,6 +350,7 @@ def _handle_responses_non_stream(
     attach_upstream_response(turn, raw)
     _dbg('上游原始响应=' + json.dumps(raw, ensure_ascii=False, default=str)[:1000])
 
+    remember_response_id(payload, raw)
     data = responses_to_cc_response(raw, ctx.client_model)
     return _finalize_chat_response(ctx, data, turn=turn, debug_label='Responses 转回聊天补全后')
 
@@ -385,6 +389,10 @@ def _handle_responses_stream(
                     'completion_tokens': extracted_usage.get('output_tokens', 0),
                     'total_tokens': extracted_usage.get('total_tokens', 0),
                 }
+            if event_type == 'response.completed':
+                response_obj = event_data.get('response') if isinstance(event_data, dict) else None
+                if isinstance(response_obj, dict):
+                    remember_response_id(payload, response_obj)
             if event_count < 10:
                 _dbg(
                     f'上游事件#{event_count} 类型={event_type} 数据='
