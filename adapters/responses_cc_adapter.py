@@ -703,7 +703,11 @@ def _append_responses_input_item(
     instructions: list[str],
     input_items: list[JsonDict],
 ) -> None:
-    """将单条 Chat Completions 消息追加为 Responses `input` 项。"""
+    """将单条 Chat Completions 消息追加为 Responses `input` 项。
+
+    尽量使用 EasyInputMessage 格式（{role, content}）以减少 token 开销，
+    提高上游 prompt caching 的前缀匹配命中率。
+    """
     if not isinstance(message, dict):
         return
 
@@ -724,21 +728,26 @@ def _append_responses_input_item(
         })
         return
 
-    item: JsonDict = {
-        'type': 'message',
-        'role': role or 'user',
-        'content': _content_to_responses_parts(content, role),
-    }
-    input_items.append(item)
+    text = _content_to_text(content)
+    has_tool_calls = bool(message.get('tool_calls'))
 
-    if role == 'assistant':
+    if role == 'assistant' and has_tool_calls:
+        if text:
+            input_items.append({
+                'type': 'message',
+                'role': 'assistant',
+                'content': [{'type': 'output_text', 'text': text}],
+            })
         for tool_call in message.get('tool_calls') or []:
             input_items.append(_build_responses_function_call_item(tool_call))
+    else:
+        input_items.append({'role': role or 'user', 'content': text or ''})
 
 
 def _convert_input_items(items: list[Any], messages: list[JsonDict]) -> None:
     """将 Responses `input` 数组重建为 Chat Completions `messages` 列表。"""
     index = 0
+    pending_reasoning: str | None = None
     while index < len(items):
         item = items[index]
 
@@ -754,20 +763,35 @@ def _convert_input_items(items: list[Any], messages: list[JsonDict]) -> None:
         item_type = item.get('type', '')
         role = item.get('role', '')
 
+        if item_type == 'reasoning':
+            pending_reasoning = _extract_reasoning_text(item)
+            index += 1
+            continue
+
         if role and not item_type:
-            messages.append({
+            msg: JsonDict = {
                 'role': role,
                 'content': _normalize_simple_content(item.get('content', '')),
-            })
+            }
+            if role == 'assistant' and pending_reasoning:
+                msg['reasoning_content'] = pending_reasoning
+                pending_reasoning = None
+            messages.append(msg)
             index += 1
             continue
 
         if item_type == 'message':
             consumed = _append_message_item(items, start=index, messages=messages)
+            if item.get('role') == 'assistant' and pending_reasoning and messages:
+                messages[-1]['reasoning_content'] = pending_reasoning
+                pending_reasoning = None
             index += consumed
             continue
 
         if item_type == 'function_call':
+            if pending_reasoning and messages and messages[-1].get('role') == 'assistant':
+                messages[-1]['reasoning_content'] = pending_reasoning
+                pending_reasoning = None
             _append_function_call_item(item, messages)
             index += 1
             continue

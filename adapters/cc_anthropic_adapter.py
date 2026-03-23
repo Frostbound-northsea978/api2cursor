@@ -261,6 +261,12 @@ def _convert_request_message(message: Any) -> tuple[JsonDict | None, str | None]
     anthropic_role = 'assistant' if role == 'assistant' else 'user'
     anthropic_content = _convert_content(message)
 
+    if role == 'assistant' and message.get('reasoning_content'):
+        thinking_block = {'type': 'thinking', 'thinking': message['reasoning_content']}
+        blocks = _to_blocks(anthropic_content)
+        blocks.insert(0, thinking_block)
+        anthropic_content = blocks
+
     if role == 'assistant' and 'tool_calls' in message:
         anthropic_content = _append_tool_use_blocks(anthropic_content, message.get('tool_calls', []))
 
@@ -463,6 +469,8 @@ def _convert_content_part(part: Any) -> JsonDict | None:
         return {'type': 'text', 'text': part.get('text', '')}
     if part_type == 'image_url':
         return _convert_image(part)
+    if part_type == 'image':
+        return part
     if part_type in ('tool_use', 'tool_result'):
         return part
     return None
